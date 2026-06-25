@@ -666,6 +666,16 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    // orka residual-VQ: bit-planed indices + per-tensor codebook + block scales.
+    // Stub trait so the type registers and the tree compiles; the block layout,
+    // dequant and CUDA mat-vec are the follow-up (orka-compiler
+    // docs/design/rvq-llama-cpp-type.md). blck_size/type_size are placeholders.
+    [GGML_TYPE_ORKA_RVQ] = {
+        .type_name                = "orka_rvq",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_Q1_0] = {
         .type_name                = "q1_0",
         .blck_size                = QK1_0,
