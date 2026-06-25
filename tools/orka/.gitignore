@@ -1,0 +1,4 @@
+ggml_orka_test
+orka_dequant_ref
+orka_gptneox_run
+orka_rvq_matmul
