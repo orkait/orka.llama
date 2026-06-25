@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-orka.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
@@ -978,6 +979,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (const llama_orka_weight * ow = llama_orka_lookup(w)) {
+        ggml_tensor * res = llama_orka_build_mm(ctx0, *ow, cur);
+        if (w_s) {
+            res = ggml_mul(ctx0, res, w_s);
+        }
+        return res;
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {

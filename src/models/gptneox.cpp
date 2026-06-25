@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-orka.h"
 
 void llama_model_gptneox::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
@@ -46,8 +47,39 @@ void llama_model_gptneox::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_gptneox::load_arch_tensors(llama_model_loader &) {
+void llama_model_gptneox::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // orka RVQ: linears are stored as side tensors (idx/cb/scales) + a fused custom op
+    uint32_t orka_u = 0;
+    ml.get_key(std::string("orka.rvq"), orka_u, false);
+    const bool orka = orka_u != 0;
+    if (orka) llama_orka_clear();
+    uint32_t o_stages = 0, o_group = 0, o_block = 0, o_gmaj = 0;
+    uint32_t o_cb[3] = {0,0,0};
+    if (orka) {
+        ml.get_key(std::string("orka.n_stages"),   o_stages);
+        ml.get_key(std::string("orka.group_size"), o_group);
+        ml.get_key(std::string("orka.block_size"), o_block);
+        ml.get_key(std::string("orka.group_major"), o_gmaj, false);
+        for (uint32_t s = 0; s < o_stages; s++)
+            ml.get_key("orka.cb_size." + std::to_string(s), o_cb[s]);
+    }
+    // load one orka linear (M out, K in) as side tensors keyed by stage-0 index; returns key
+    auto load_orka = [&](llm_tensor tid, int i, int64_t M, int64_t K) -> ggml_tensor * {
+        const int64_t idx_len = M * K / o_group;
+        const int64_t sc_len  = M * K / o_block;
+        llama_orka_weight w{};
+        w.M = (int) M; w.K = (int) K; w.group_size = o_group; w.block_size = o_block;
+        w.n_stages = o_stages; w.group_major = (int) o_gmaj;
+        for (uint32_t s = 0; s < o_stages; s++) {
+            w.idx[s] = create_tensor(tn(tid, ("weight.idx" + std::to_string(s)).c_str(), i), {idx_len}, 0);
+            w.cb[s]  = create_tensor(tn(tid, ("weight.cb"  + std::to_string(s)).c_str(), i), {(int64_t) o_cb[s] * o_group}, 0);
+        }
+        w.scales = create_tensor(tn(tid, "weight.scales", i), {sc_len}, 0);
+        llama_orka_register(w.idx[0], w);
+        return (ggml_tensor *) w.idx[0];
+    };
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -62,20 +94,24 @@ void llama_model_gptneox::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm   = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
         layer.attn_norm_b = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd}, 0);
 
-        layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, 0);
-        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", i), {n_embd + 2*n_embd_gqa}, 0);
-
-        layer.wo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
-        layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd}, 0);
+        if (orka) {
+            layer.wqkv     = load_orka(LLM_TENSOR_ATTN_QKV,  i, n_embd + 2*n_embd_gqa, n_embd);
+            layer.wo       = load_orka(LLM_TENSOR_ATTN_OUT,  i, n_embd,                n_embd);
+            layer.ffn_down = load_orka(LLM_TENSOR_FFN_DOWN,  i, n_embd,                n_ff);
+            layer.ffn_up   = load_orka(LLM_TENSOR_FFN_UP,    i, n_ff,                  n_embd);
+        } else {
+            layer.wqkv     = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, 0);
+            layer.wo       = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+        }
+        layer.wqkv_b     = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", i), {n_embd + 2*n_embd_gqa}, 0);
+        layer.wo_b       = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd}, 0);
+        layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, 0);
+        layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff}, 0);
 
         layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
         layer.ffn_norm_b = create_tensor(tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd}, 0);
-
-        layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-        layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, 0);
-
-        layer.ffn_up     = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
-        layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff}, 0);
     }
 }
 
