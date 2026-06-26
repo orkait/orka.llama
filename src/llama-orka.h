@@ -16,12 +16,19 @@ struct llama_orka_weight {
     const ggml_tensor * cb[3];
     const ggml_tensor * scales;
     int M, K, group_size, block_size, n_stages, group_major;
+    ggml_tensor * Wmat = nullptr;   // materialized W^T [K,M] (load-time decompress), else null
 };
 
 // Register/lookup a weight by its key tensor (per model load; cleared on free).
 void                       llama_orka_register(const ggml_tensor * key, const llama_orka_weight & w);
 const llama_orka_weight *  llama_orka_lookup(const ggml_tensor * key);
 void                       llama_orka_clear();
+
+// Load-time decompress: reconstruct every registered weight into a persistent W^T tensor
+// (on the same backend buffer type as its side tensors) so decode uses a plain mul_mat
+// instead of rebuilding W per token. Keeps the gguf compressed on disk; W lives in memory.
+// Enabled when env ORKA_DECOMPRESS is set. No-op otherwise. Call after tensor data loads.
+void                       llama_orka_materialize();
 
 // Emit the fused dequant-matmul node: y[M, N] = W @ cur, cur is [K, N].
 ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & w, ggml_tensor * cur);
