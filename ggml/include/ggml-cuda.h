@@ -7,6 +7,19 @@
 extern "C" {
 #endif
 
+// orka RVQ warp GEMV (N=1 decode, compressed-resident). args' pointers reference the
+// loaded gguf tensors (device, persistent); the caller owns args for the graph's lifetime.
+struct ggml_orka_warp_args {
+    const void * lo[3];
+    const void * hi[3];
+    const void * cb[3];
+    const void * scale;
+    int M, GPR, BPR, GPB, G, HI_BITS, N_STAGES;
+};
+// Build a node y[M,1] = W @ x (x must be F16). Available only in CUDA builds.
+GGML_API struct ggml_tensor * ggml_orka_warp(struct ggml_context * ctx, struct ggml_tensor * x,
+                                             const struct ggml_orka_warp_args * args);
+
 #ifdef GGML_USE_HIP
 #define GGML_CUDA_NAME "ROCm"
 #define GGML_CUBLAS_NAME "hipBLAS"

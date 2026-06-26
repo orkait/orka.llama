@@ -2777,8 +2777,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// orka RVQ warp GEMV (defined in orka-rvq.cu)
+bool ggml_cuda_is_orka_warp(const struct ggml_tensor * dst);
+void ggml_cuda_orka_warp(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
+        case GGML_OP_CUSTOM:
+            if (!ggml_cuda_is_orka_warp(dst)) return false;
+            ggml_cuda_orka_warp(ctx, dst);
+            break;
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -5054,6 +5062,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_is_orka_warp(op);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:

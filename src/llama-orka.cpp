@@ -70,6 +70,22 @@ void llama_orka_finalize() {
                 }
                 ggml_backend_tensor_set(w.idx[s], idx.data(), 0, count * sizeof(int32_t));
             }
+            // warp GEMV args (N=1 decode): device pointers straight to the bit-planes.
+            const char * bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(w.lo[0]->buffer));
+            if (bn && strstr(bn, "CUDA")) {
+                for (int s = 0; s < 3; s++) {
+                    int s0 = s < w.n_stages ? s : 0;     // unused stages alias stage 0
+                    w.warp.lo[s] = w.lo[s0]->data;
+                    w.warp.hi[s] = w.hi[s0]->data;
+                    w.warp.cb[s] = w.cb[s0]->data;
+                }
+                w.warp.scale = w.scales->data;
+                w.warp.M = w.M; w.warp.G = w.group_size; w.warp.GPR = w.K / w.group_size;
+                w.warp.BPR = w.K / w.block_size; w.warp.GPB = w.block_size / w.group_size;
+                w.warp.HI_BITS = w.idx_bits[0] > 8 ? w.idx_bits[0] - 8 : 0;
+                w.warp.N_STAGES = w.n_stages;
+                w.warp_ready = true;
+            }
         }
     }
     llama_orka_materialize();
@@ -136,6 +152,13 @@ ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & 
     if (w.Wmat) {
         return ggml_mul_mat(ctx, w.Wmat, cur);   // decompressed-resident: plain GPU mul_mat
     }
+#ifdef GGML_USE_CUDA
+    // N=1 decode on GPU: warp GEMV straight off the bit-planes (compressed-resident, no W).
+    if (cur->ne[1] == 1 && w.warp_ready) {
+        ggml_tensor * xf = ggml_cast(ctx, cur, GGML_TYPE_F16);
+        return ggml_orka_warp(ctx, xf, &w.warp);
+    }
+#endif
     const int M = w.M, K = w.K, G = w.group_size, B = w.block_size, S = w.n_stages;
     const int GPR = K / G, BPR = K / B;
 

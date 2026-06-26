@@ -1121,6 +1121,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             op = info.op;
         }
+        // orka RVQ side tensors (idxlo/idxhi/cb/scales) are raw data read by a custom kernel,
+        // not typed CUDA-op inputs - select_weight_buft rejects the GPU for them (no I8
+        // mul_mat) so they land on CPU, forcing CPU<->GPU copies every token. Force them onto
+        // the layer's primary buffer (GPU when offloaded).
+        bool orka_side = tn.suffix != nullptr && (strstr(tn.suffix, "idxlo") || strstr(tn.suffix, "idxhi")
+                          || strstr(tn.suffix, ".cb") || strstr(tn.suffix, ".scales"));
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -1180,6 +1186,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (!buft && orka_side && buft_list && !buft_list->empty()) {
+            buft = buft_list->front().second;  // layer's primary buffer (GPU when offloaded)
+        }
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
