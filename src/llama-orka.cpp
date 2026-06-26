@@ -149,16 +149,18 @@ void llama_orka_materialize() {
 }
 
 ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & w, ggml_tensor * cur) {
-    if (w.Wmat) {
-        return ggml_mul_mat(ctx, w.Wmat, cur);   // decompressed-resident: plain GPU mul_mat
-    }
 #ifdef GGML_USE_CUDA
-    // N=1 decode on GPU: warp GEMV straight off the bit-planes (compressed-resident, no W).
+    // hybrid: N=1 decode -> warp GEMV off the bit-planes (396 t/s, no W); this beats both the
+    // materialized mul_mat (110) and the get_rows path, so it takes priority for decode even
+    // when Wmat exists. N>1 prefill falls through to Wmat (fast GEMM) or get_rows below.
     if (cur->ne[1] == 1 && w.warp_ready) {
         ggml_tensor * xf = ggml_cast(ctx, cur, GGML_TYPE_F16);
         return ggml_orka_warp(ctx, xf, &w.warp);
     }
 #endif
+    if (w.Wmat) {
+        return ggml_mul_mat(ctx, w.Wmat, cur);   // prefill (N>1): materialized Q8 GEMM
+    }
     const int M = w.M, K = w.K, G = w.group_size, B = w.block_size, S = w.n_stages;
     const int GPR = K / G, BPR = K / B;
 
