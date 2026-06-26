@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-orka.h"
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     uint32_t n_vocab = 0;
@@ -31,8 +32,39 @@ void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_llama::load_arch_tensors(llama_model_loader &) {
+void llama_model_llama::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // orka RVQ: linears stored as bit-plane side tensors + fused warp/reconstruct op
+    uint32_t orka_u = 0;
+    ml.get_key(std::string("orka.rvq"), orka_u, false);
+    const bool orka = orka_u != 0;
+    if (orka) llama_orka_clear();
+    uint32_t o_stages = 0, o_group = 0, o_block = 0, o_gmaj = 0, o_cb[3] = {0,0,0};
+    if (orka) {
+        ml.get_key(std::string("orka.n_stages"),   o_stages);
+        ml.get_key(std::string("orka.group_size"), o_group);
+        ml.get_key(std::string("orka.block_size"), o_block);
+        ml.get_key(std::string("orka.group_major"), o_gmaj, false);
+        for (uint32_t s = 0; s < o_stages; s++) ml.get_key("orka.cb_size." + std::to_string(s), o_cb[s]);
+    }
+    auto load_orka = [&](llm_tensor tid, int i, int64_t M, int64_t K) -> ggml_tensor * {
+        const int64_t idx_len = M * K / o_group, sc_len = M * K / o_block;
+        llama_orka_weight w{};
+        w.M = (int) M; w.K = (int) K; w.group_size = o_group; w.block_size = o_block;
+        w.n_stages = o_stages; w.group_major = (int) o_gmaj;
+        for (uint32_t s = 0; s < o_stages; s++) {
+            int bits = 0; while ((1u << bits) < o_cb[s]) bits++;
+            w.idx_bits[s] = bits;
+            int64_t hi_bytes = bits > 8 ? (idx_len * (bits - 8) + 7) / 8 : 1;
+            w.lo[s] = create_tensor(tn(tid, ("weight.idxlo" + std::to_string(s)).c_str(), i), {idx_len}, 0);
+            w.hi[s] = create_tensor(tn(tid, ("weight.idxhi" + std::to_string(s)).c_str(), i), {hi_bytes}, 0);
+            w.cb[s] = create_tensor(tn(tid, ("weight.cb"   + std::to_string(s)).c_str(), i), {(int64_t) o_cb[s] * o_group}, 0);
+        }
+        w.scales = create_tensor(tn(tid, "weight.scales", i), {sc_len}, 0);
+        llama_orka_register(w.lo[0], w);
+        return (ggml_tensor *) w.lo[0];
+    };
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -50,8 +82,15 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
+        if (orka) {
+            layer.wq = load_orka(LLM_TENSOR_ATTN_Q, i, n_embd_head_k * n_head, n_embd);
+            layer.wk = load_orka(LLM_TENSOR_ATTN_K, i, n_embd_k_gqa,           n_embd);
+            layer.wv = load_orka(LLM_TENSOR_ATTN_V, i, n_embd_v_gqa,           n_embd);
+            layer.wo = load_orka(LLM_TENSOR_ATTN_OUT, i, n_embd, n_embd_head_k * n_head);
+        } else {
         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        }
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
@@ -66,7 +105,11 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
             layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
         }
 
-        if (n_expert == 0) {
+        if (n_expert == 0 && orka) {
+            layer.ffn_gate = load_orka(LLM_TENSOR_FFN_GATE, i, n_ff,   n_embd);
+            layer.ffn_up   = load_orka(LLM_TENSOR_FFN_UP,   i, n_ff,   n_embd);
+            layer.ffn_down = load_orka(LLM_TENSOR_FFN_DOWN, i, n_embd, n_ff);
+        } else if (n_expert == 0) {
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
