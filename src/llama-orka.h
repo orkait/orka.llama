@@ -9,6 +9,7 @@
 // weight through the fused dequant-matmul custom op instead of ggml_mul_mat.
 
 #include "ggml.h"
+#include "ggml-cuda.h"   // ggml_orka_warp_args / ggml_orka_warp (CUDA builds)
 #include <cstdint>
 
 struct llama_orka_weight {
@@ -20,6 +21,8 @@ struct llama_orka_weight {
     const ggml_tensor * scales;
     int M, K, group_size, block_size, n_stages, group_major;
     ggml_tensor * Wmat = nullptr;   // materialized W^T [K,M] (load-time decompress), else null
+    ggml_orka_warp_args warp{};     // device ptrs + dims for the N=1 warp GEMV
+    bool warp_ready = false;        // true once warp args filled + weights on CUDA
 };
 
 // Register/lookup a weight by its key tensor (per model load; cleared on free).
