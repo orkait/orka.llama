@@ -12,7 +12,10 @@
 #include <cstdint>
 
 struct llama_orka_weight {
-    const ggml_tensor * idx[3];
+    const ggml_tensor * lo[3];      // bit-plane index low byte (uint8), from gguf
+    const ggml_tensor * hi[3];      // bit-plane index high bits packed (uint8), from gguf
+    int idx_bits[3];                // index width per stage (= log2 codebook size)
+    ggml_tensor * idx[3] = {};      // unpacked I32 indices (allocated at finalize)
     const ggml_tensor * cb[3];
     const ggml_tensor * scales;
     int M, K, group_size, block_size, n_stages, group_major;
@@ -29,6 +32,10 @@ void                       llama_orka_clear();
 // instead of rebuilding W per token. Keeps the gguf compressed on disk; W lives in memory.
 // Enabled when env ORKA_DECOMPRESS is set. No-op otherwise. Call after tensor data loads.
 void                       llama_orka_materialize();
+
+// Called after tensor data loads: unpacks each weight's bit-plane indices (lo/hi) into a
+// resident I32 idx tensor (needed by ggml_get_rows), then runs llama_orka_materialize.
+void                       llama_orka_finalize();
 
 // Emit the fused dequant-matmul node: y[M, N] = W @ cur, cur is [K, N].
 ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & w, ggml_tensor * cur);
