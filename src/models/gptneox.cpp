@@ -73,12 +73,16 @@ void llama_model_gptneox::load_arch_tensors(llama_model_loader & ml) {
         w.M = (int) M; w.K = (int) K; w.group_size = o_group; w.block_size = o_block;
         w.n_stages = o_stages; w.group_major = (int) o_gmaj;
         for (uint32_t s = 0; s < o_stages; s++) {
-            w.idx[s] = create_tensor(tn(tid, ("weight.idx" + std::to_string(s)).c_str(), i), {idx_len}, 0);
+            int bits = 0; while ((1u << bits) < o_cb[s]) bits++;        // log2(codebook size)
+            w.idx_bits[s] = bits;
+            int64_t hi_bytes = bits > 8 ? (idx_len * (bits - 8) + 7) / 8 : 1;
+            w.lo[s] = create_tensor(tn(tid, ("weight.idxlo" + std::to_string(s)).c_str(), i), {idx_len}, 0);
+            w.hi[s] = create_tensor(tn(tid, ("weight.idxhi" + std::to_string(s)).c_str(), i), {hi_bytes}, 0);
             w.cb[s]  = create_tensor(tn(tid, ("weight.cb"  + std::to_string(s)).c_str(), i), {(int64_t) o_cb[s] * o_group}, 0);
         }
         w.scales = create_tensor(tn(tid, "weight.scales", i), {sc_len}, 0);
-        llama_orka_register(w.idx[0], w);
-        return (ggml_tensor *) w.idx[0];
+        llama_orka_register(w.lo[0], w);
+        return (ggml_tensor *) w.lo[0];
     };
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);

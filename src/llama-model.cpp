@@ -1554,9 +1554,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // orka: optional load-time decompress (reconstruct W from RVQ side tensors into a
-    // resident W^T tensor so decode uses plain mul_mat). No-op unless ORKA_DECOMPRESS set.
-    llama_orka_materialize();
+    // orka: unpack bit-plane indices -> resident I32, then optional load-time W decompress.
+    llama_orka_finalize();
 
     return true;
 }
