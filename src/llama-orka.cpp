@@ -31,15 +31,15 @@ ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & 
     ggml_tensor * WT = nullptr;
     for (int s = 0; s < S; s++) {
         int64_t cbsz = ggml_nelements(w.cb[s]) / G;
-        // F32 codebook so get_rows output is F32 (avoids F16 stride asserts on CUDA binops)
+        // F16 cb (smaller -> better bandwidth) cast to F32 so get_rows output is F32
+        // (avoids F16 stride asserts on CUDA binops); the cast is cheap vs the bandwidth win.
         ggml_tensor * cb2 = ggml_cast(ctx, ggml_reshape_2d(ctx, (ggml_tensor *) w.cb[s], G, cbsz), GGML_TYPE_F32);
         ggml_tensor * gr  = ggml_get_rows(ctx, cb2, (ggml_tensor *) w.idx[s]); // [G, M*GPR] f32
         WT = WT ? ggml_add(ctx, WT, gr) : gr;
     }
     WT = ggml_reshape_3d(ctx, ggml_cont(ctx, WT), B, BPR, M);                  // [block, BPR, M]
-    ggml_tensor * sc = ggml_cast(ctx, (ggml_tensor *) w.scales, GGML_TYPE_F32);// f32 [M*BPR]
-    sc = ggml_reshape_3d(ctx, sc, 1, BPR, M);
-    sc = ggml_cont(ctx, ggml_repeat(ctx, sc, WT));                            // [block, BPR, M] f32
+    ggml_tensor * sc = ggml_cast(ctx, (ggml_tensor *) w.scales, GGML_TYPE_F32);
+    sc = ggml_reshape_3d(ctx, sc, 1, BPR, M);                                 // broadcast over block
     WT = ggml_mul(ctx, WT, sc);
     WT = ggml_reshape_2d(ctx, WT, K, M);                                      // [K, M] = W^T
     return ggml_mul_mat(ctx, WT, cur);                                        // [M, N]
