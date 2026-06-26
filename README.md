@@ -1,124 +1,127 @@
-# llama.cpp
-
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
-
 <div align="center">
 
-<b>LLM inference in C/C++</b>
+# 🐋 orka.cpp
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+**A [llama.cpp](https://github.com/ggerganov/llama.cpp) fork that runs [orka](https://github.com/orkait/orka-compiler) RVQ-compressed models end to end - compressed on disk, compressed in VRAM, and decoded straight off the bit-planes.**
 
-[manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3A0cc4m%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev branches](https://github.com/ggml-org/llama.cpp-dev/blob/master/README-features.md) / [compile times](https://github.com/ggml-org/llama.cpp-dev/blob/master/README-compile-times.md) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+[![base](https://img.shields.io/badge/fork_of-llama.cpp-000000?logo=cplusplus&logoColor=white)](https://github.com/ggerganov/llama.cpp)
+[![CUDA](https://img.shields.io/badge/CUDA-warp_GEMV-76B900?logo=nvidia&logoColor=white)](#-how-it-works)
+[![format](https://img.shields.io/badge/format-12--bit_bit--planes-4f8ff7)](#-how-it-works)
+[![decode](https://img.shields.io/badge/decode-404_tok%2Fs-7c3aed)](#-benchmarks)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
 
-## Quick start
+---
 
-A few options to get `llama.cpp` installed on your machine:
+> Upstream llama.cpp docs: see [`docs/`](docs/) and the [original README in git history](https://github.com/ggerganov/llama.cpp/blob/master/README.md). This README covers the orka additions.
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+## 🧭 What it is
 
-Once installed:
+orka.cpp adds the **orka RVQ quant type** to llama.cpp. A model compressed by the
+[orka-compiler](https://github.com/orkait/orka-compiler) (residual vector quantization:
+per-tensor codebooks + bit-planed indices) loads and runs through the **real llama.cpp
+engine** - KV cache, CUDA graphs, the lot. Decode reads the **12-bit bit-planes directly on
+the GPU** via a warp-per-row kernel, so it never materializes the full-precision weights.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+The headline: **because the weights stay compressed, decode reads fewer bytes - and decode
+is memory-bound, so compression *is* the speed win.**
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+## ⚡ Benchmarks
+
+RTX 3060 (12 GB), `-ngl 99`. Decode = autoregressive generation (N=1), the hot path.
+
+### Speed - pythia-160m (gptneox), 3-stage RVQ @ ~4.5 bpw, 147 MB gguf
+
+| Mode | Prefill tok/s | Decode tok/s | Notes |
+|---|--:|--:|---|
+| `mul_mat` (materialized Q8) | 10,236 | 110 | dequantizes to Q8, then GEMV |
+| **warp kernel** (default) | 254 | **404** | reads bit-planes, no W materialized |
+| **hybrid** (`ORKA_DECOMPRESS=1`) | **37,790** | **404** | Q8 GEMM prefill + warp decode |
+
+Decode is **3.6x faster than the materialized path** - the compressed form is the fast form.
+
+### Speed - SmolLM-135M (llama arch), same recipe, 170 MB gguf
+
+| Mode | Prefill tok/s | Decode tok/s |
+|---|--:|--:|
+| warp (default) | 191 | **255** |
+| hybrid | **22,491** | 255 |
+
+Two architecture families (gptneox + llama) run the identical engine - the warp kernel,
+loader hook, and bit-plane path are arch-agnostic.
+
+### Quality - equal-bit perplexity vs bitsandbytes nf4
+
+Same 4.5 bits/param on the linears, same eval text. Lower is better.
+
+| Model | arch | fp16 | bnb-nf4 (4-bit) | **orka 3-stage** | winner |
+|---|---|--:|--:|--:|---|
+| pythia-160m | gptneox | 2.57 | 3.26 | **3.21** | **orka** |
+| Qwen2.5-0.5B | qwen2 | 2.00 | 2.035 | 2.044 | bnb (+0.4%) |
+| SmolLM-135M | llama | 1.954 | 2.144 | **1.977** | **orka (+8%)** |
+
+At matched bits, orka's RVQ is **competitive-to-better than best-of-breed 4-bit** - it wins
+2 of 3, decisively on SmolLM (within 1.2% of fp16 while nf4 is +9.7%).
+
+## 🔬 How it works
+
+```
+weight [out, in]
+  ──pack──▶  per-stage codebook (4096 entries) + indices
+  ──store─▶  indices as 12-bit BIT-PLANES (lo uint8 + packed hi)   ← 2.7x tighter than int32
+  ──decode▶  warp-per-row GEMV reads planes + cached codebook on GPU
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+- **Bit-planes**: each index is `lo (8 bits) | hi (width-8 bits, packed)`. 12-bit indices,
+  not int32 - the disk and the DRAM traffic shrink with the compression.
+- **Warp kernel** (`ggml/src/ggml-cuda/orka-rvq.cu`): one warp per output row, sums the RVQ
+  stages, shfl-reduces. The codebook is tiny (~64 KB) and **L2-cached** - so decode streams
+  only the indices from DRAM, never the weights. That is why it beats `mul_mat`.
+- **Routing**: N=1 decode → warp kernel; N>1 prefill → materialized Q8 GEMM (cuBLAS-fast).
+- **Output head stays Q8** - the head is RVQ-fragile (ppl explodes); int8 is lossless.
 
-## Description
+<details>
+<summary>📐 The pieces added to llama.cpp</summary>
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+| File | Role |
+|---|---|
+| `src/llama-orka.{h,cpp}` | weight registry, bit-plane unpack (`llama_orka_finalize`), `build_mm` routing |
+| `ggml/src/ggml-cuda/orka-rvq.cu` | warp-per-row GEMV CUDA kernel + `GGML_OP_CUSTOM` dispatch |
+| `ggml/include/ggml-cuda.h` | `ggml_orka_warp` builder + args |
+| `src/llama-graph.cpp` | `build_lora_mm` hook (routes any orka weight through the op) |
+| `src/models/{gptneox,llama}.cpp` | per-arch loader branches (load bit-plane side tensors) |
+| `src/llama-model-loader.cpp` | force orka side tensors onto the GPU buffer (the placement fix) |
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+</details>
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## 🚀 Quick start
 
-## Supported backends
+```bash
+# 1. compress a model with orka-compiler -> a .orka artifact (see that repo)
+# 2. convert .orka -> a llama.cpp-native bit-plane gguf
+python scripts/export_gguf_llama.py  model.orka  <hf-model-dir>  model.gguf   # llama arch
+# (or export_gguf_llamacpp.py for gptneox)
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+# 3. build with CUDA
+cmake -B build -DGGML_CUDA=ON && cmake --build build -j
 
-## Documentation
+# 4. run
+./build/bin/llama-cli -m model.gguf -ngl 99 -p "..."              # warp decode (default)
+ORKA_DECOMPRESS=1 ./build/bin/llama-bench -m model.gguf -ngl 99   # hybrid (fast prefill)
+```
 
-#### Tools
+> The `scripts/export_gguf_*.py` converters live in the
+> [orka-compiler](https://github.com/orkait/orka-compiler) repo.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## 🔄 Staying current with llama.cpp
 
-#### Development
+```bash
+git fetch upstream && git rebase upstream/master && git push --force-with-lease origin main
+```
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
+## 📄 License
 
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+MIT, same as upstream llama.cpp. All credit to the
+[llama.cpp / ggml](https://github.com/ggerganov/llama.cpp) authors; orka.cpp only adds the
+RVQ quant type and kernels.
