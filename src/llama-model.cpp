@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-orka.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1552,6 +1553,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // orka: optional load-time decompress (reconstruct W from RVQ side tensors into a
+    // resident W^T tensor so decode uses plain mul_mat). No-op unless ORKA_DECOMPRESS set.
+    llama_orka_materialize();
 
     return true;
 }
