@@ -69,6 +69,16 @@ ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader
         return nullptr;
     }
 
+    // orka.py can emit shapes this runtime cannot decode. Refuse them by name rather than
+    // producing wrong numbers: every check below is a silent-corruption path, not a crash.
+    //   - the GEMV walks the group as __half2 pairs, so an odd group has no representation
+    //   - scales are indexed per block, so blocks must tile groups exactly
+    if (g_orka_group == 0 || (g_orka_group & 1) ||
+        g_orka_block == 0 || g_orka_block % g_orka_group != 0) {
+        GGML_ABORT("orka: group_size=%u block_size=%u unsupported (need an even group and "
+                   "a block that is a whole number of groups)", g_orka_group, g_orka_block);
+    }
+
     const int64_t K = ne0, M = ne1;
     const int64_t idx_len = M * K / g_orka_group;
     const int64_t sc_len  = M * K / g_orka_block;
@@ -95,6 +105,16 @@ ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader
         const int64_t cbsz = ggml_nelements(cbm) / g_orka_group;
         int bits = 0;
         while ((1ll << bits) < cbsz) bits++;
+        // orka_idx packs `8 / hb` high-bit fields per byte with integer division, so an hb
+        // that does not divide 8 reads from the wrong offset and decodes silently wrong
+        // weights. Permitted widths are 8, 9, 10, 12, 16 bits (codebooks 256..65536).
+        const int hb = bits > 8 ? bits - 8 : 0;
+        if (hb != 0 && 8 % hb != 0) {
+            GGML_ABORT("orka: %s stage %d uses a %d-bit index (codebook %lld); this runtime "
+                       "supports 8, 9, 10, 12 or 16 bits. Repack with a codebook size of "
+                       "256, 512, 1024, 4096 or 65536.",
+                       base.c_str(), s, bits, (long long) cbsz);
+        }
         const int64_t hi_bytes = bits > 8 ? (idx_len * (bits - 8) + 7) / 8 : 1;
         w.lo[s] = side(".idxlo" + ss, { idx_len });
         w.hi[s] = side(".idxhi" + ss, { hi_bytes });
@@ -103,6 +123,12 @@ ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader
         n_stages++;
     }
     GGML_ASSERT(n_stages > 0);
+    // The kernel unrolls at most three residual stages. A deeper pack would otherwise load
+    // here with its tail stages quietly dropped, which reads as a mysterious quality loss.
+    if (ml.get_weight((base + ".idxlo3").c_str()) != nullptr) {
+        GGML_ABORT("orka: %s has more than 3 RVQ stages; this runtime decodes at most 3. "
+                   "Repack with fewer stages.", base.c_str());
+    }
     w.n_stages = n_stages;
     w.scales = side(".scales", { sc_len });
     if (ml.get_weight((base + ".corr_ptr").c_str()) != nullptr) {
