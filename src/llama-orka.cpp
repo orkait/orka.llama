@@ -113,6 +113,12 @@ ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader
         w.corr_col = side(".corr_col", { nnz });
         w.corr_val = side(".corr_val", { nnz });
     }
+    // M is the OUTPUT WIDTH of the warp node, so it is shape, not state: ggml_orka_warp sizes
+    // its result as [args->M, N]. finalize() skips the -fit dry-run load (no backend buffer
+    // yet), which used to leave M at 0 and produce a zero-width matmul - LFM2 then split that
+    // into three 0-wide conv chunks and aborted in ggml_concat. Everything else in warp is a
+    // device pointer and correctly belongs to finalize.
+    w.warp.M = (int) M;
     llama_orka_register(w.lo[0], w);
     return (ggml_tensor *) w.lo[0];
 }
