@@ -95,7 +95,10 @@ void ggml_cuda_orka_warp(ggml_backend_cuda_context & ctx, struct ggml_tensor * d
     const ggml_orka_warp_args * a = (const ggml_orka_warp_args *) p->userdata;
     const __half * x = (const __half *) dst->src[0]->data;   // [K, N] fp16
     float * y = (float *) dst->data;                         // [M, N] f32
-    const int N = (int) dst->ne[1];
+    // The GEMV is one column per blockIdx.y and both operands are contiguous, so a batched
+    // activation is just more columns: fold ne2/ne3 into N rather than only walking ne1.
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(dst->src[0]));
+    const int N = (int) (dst->ne[1] * dst->ne[2] * dst->ne[3]);
     int th = 256;
     dim3 grid((a->M * 32 + th - 1) / th, N);
     orka_gemv_planes<<<grid, th, 0, ctx.stream()>>>(
@@ -109,10 +112,13 @@ void ggml_cuda_orka_warp(ggml_backend_cuda_context & ctx, struct ggml_tensor * d
         a->HI_BITS[0], a->HI_BITS[1], a->HI_BITS[2], a->N_STAGES);
 }
 
-// graph builder (host): a custom node y[M,N] with the sentinel fn + args as userdata.
+// graph builder (host): a custom node y[M,...] with the sentinel fn + args as userdata.
+// The trailing dims are carried through from the activation: ggml_mul_mat would keep them,
+// and architectures that batch sequences (LFM2 feeds [n_embd, n_seq_tokens, n_seqs]) need
+// them. Pinning ne2/ne3 to 1 silently dropped the sequence axis.
 struct ggml_tensor * ggml_orka_warp(struct ggml_context * ctx, struct ggml_tensor * x,
                                     const struct ggml_orka_warp_args * args) {
     struct ggml_tensor * srcs[1] = { x };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, args->M, x->ne[1], 1, 1, srcs, 1,
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, args->M, x->ne[1], x->ne[2], x->ne[3], srcs, 1,
                           orka_warp_cpu, 1, (void *) args);
 }
