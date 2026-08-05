@@ -7,16 +7,23 @@
 extern "C" {
 #endif
 
-// orka RVQ warp GEMV (N=1 decode, compressed-resident). args' pointers reference the
-// loaded gguf tensors (device, persistent); the caller owns args for the graph's lifetime.
+// orka RVQ warp GEMV (compressed-resident). args' pointers reference the loaded gguf
+// tensors (device, persistent); the caller owns args for the graph's lifetime.
+// HI_BITS is per stage (heterogeneous widths: e.g. 16-bit stage 0 + 8-bit stage 1).
+// corr_* is an optional CSR delta (salient/outlier exact-value corrections):
+// y = W_rvq @ x + corr @ x; all three null when the weight carries no correction.
 struct ggml_orka_warp_args {
     const void * lo[3];
     const void * hi[3];
     const void * cb[3];
     const void * scale;
-    int M, GPR, BPR, GPB, G, HI_BITS, N_STAGES;
+    const void * corr_ptr;   // int32 [M+1] or null
+    const void * corr_col;   // int32 [nnz]
+    const void * corr_val;   // fp16  [nnz]
+    int M, GPR, BPR, GPB, G, N_STAGES;
+    int HI_BITS[3];
 };
-// Build a node y[M,1] = W @ x (x must be F16). Available only in CUDA builds.
+// Build a node y[M,N] = W @ x (x must be F16 [K,N]; one warp per output row per column).
 GGML_API struct ggml_tensor * ggml_orka_warp(struct ggml_context * ctx, struct ggml_tensor * x,
                                              const struct ggml_orka_warp_args * args);
 

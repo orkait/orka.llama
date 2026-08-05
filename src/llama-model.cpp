@@ -1561,6 +1561,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // orka RVQ (arch-agnostic): any 2D weight may be stored as bit-plane side tensors
+    // instead of a dense tensor. The resolver creates + registers them (recursing here
+    // for the 1D side tensors) and returns the key tensor; null means "stored dense".
+    if (ne.size() == 2) {
+        if (ggml_tensor * t = llama_orka_try_create(*this, ml, tn, ne.begin()[0], ne.begin()[1])) {
+            return t;
+        }
+    }
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
