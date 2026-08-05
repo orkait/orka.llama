@@ -15,13 +15,18 @@
 struct llama_orka_weight {
     const ggml_tensor * lo[3];      // bit-plane index low byte (uint8), from gguf
     const ggml_tensor * hi[3];      // bit-plane index high bits packed (uint8), from gguf
-    int idx_bits[3];                // index width per stage (= log2 codebook size)
+    int idx_bits[3];                // index width per stage (= log2 codebook size), per tensor
     ggml_tensor * idx[3] = {};      // unpacked I32 indices (allocated at finalize)
     const ggml_tensor * cb[3];
     const ggml_tensor * scales;
+    // Optional CSR delta carrying salient/outlier exact-value corrections:
+    // y = W_rvq @ x + corr @ x. All null when the weight has no correction.
+    const ggml_tensor * corr_ptr = nullptr;   // int32 [M+1]
+    const ggml_tensor * corr_col = nullptr;   // int32 [nnz]
+    const ggml_tensor * corr_val = nullptr;   // fp16  [nnz]
     int M, K, group_size, block_size, n_stages, group_major;
     ggml_tensor * Wmat = nullptr;   // materialized W^T [K,M] (load-time decompress), else null
-    ggml_orka_warp_args warp{};     // device ptrs + dims for the N=1 warp GEMV
+    ggml_orka_warp_args warp{};     // device ptrs + dims for the warp GEMV
     bool warp_ready = false;        // true once warp args filled + weights on CUDA
 };
 
@@ -29,6 +34,19 @@ struct llama_orka_weight {
 void                       llama_orka_register(const ggml_tensor * key, const llama_orka_weight & w);
 const llama_orka_weight *  llama_orka_lookup(const ggml_tensor * key);
 void                       llama_orka_clear();
+
+// Arch-agnostic side-tensor resolution, called by llama_model_base::create_tensor for
+// every 2D weight. If the gguf carries orka.rvq and {tn}.idxlo0 exists, creates the
+// side tensors ({tn}.idxlo{s}/idxhi{s}/cb{s}/scales[, corr_ptr/corr_col/corr_val]),
+// registers the weight (per-stage widths derived from each cb tensor's size), and
+// returns the stage-0 index tensor to stand in as the layer weight. Returns null when
+// the weight is stored dense - the caller then follows its normal path. No per-arch
+// loader code is needed for a new architecture.
+struct llama_model_base;
+struct llama_model_loader;
+struct LLM_TN_IMPL;
+ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader & ml,
+                                    const LLM_TN_IMPL & tn, int64_t ne0, int64_t ne1);
 
 // Load-time decompress: reconstruct every registered weight into a persistent W^T tensor
 // (on the same backend buffer type as its side tensors) so decode uses a plain mul_mat
