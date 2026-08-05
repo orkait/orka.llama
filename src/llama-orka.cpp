@@ -1,9 +1,14 @@
 #include "llama-orka.h"
+#include "llama-model.h"
+#include "llama-model-loader.h"
+#include "llama-arch.h"
 #include "ggml-backend.h"
 
+#include <string>
 #include <unordered_map>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <vector>
 
 // keyed by the stage-0 index tensor pointer (reused as the layer weight pointer)
@@ -28,6 +33,90 @@ void llama_orka_clear() {
     if (g_orka_idx_ctx) { ggml_free(g_orka_idx_ctx); g_orka_idx_ctx = nullptr; }
 }
 
+// ---- arch-agnostic side-tensor resolution (see llama-orka.h) ----
+
+// Per-load state: which loader the KVs were read from, and what they said. A new
+// llama_model_loader instance means a new model load - reset the registry and re-read.
+static const llama_model_loader * g_orka_ml = nullptr;
+static bool     g_orka_on = false;
+static uint32_t g_orka_group = 8, g_orka_block = 32, g_orka_gmaj = 0;
+
+ggml_tensor * llama_orka_try_create(llama_model_base & model, llama_model_loader & ml,
+                                    const LLM_TN_IMPL & tn, int64_t ne0, int64_t ne1) {
+    if (&ml != g_orka_ml) {
+        llama_orka_clear();
+        g_orka_ml = &ml;
+        uint32_t on = 0;
+        ml.get_key("orka.rvq", on, false);
+        g_orka_on = on != 0;
+        if (g_orka_on) {
+            ml.get_key("orka.group_size", g_orka_group);
+            ml.get_key("orka.block_size", g_orka_block);
+            g_orka_gmaj = 0;
+            ml.get_key("orka.group_major", g_orka_gmaj, false);
+        }
+    }
+    if (!g_orka_on) {
+        return nullptr;
+    }
+    const std::string base = tn.str();
+    static const char wsuf[] = ".weight";
+    if (base.size() < sizeof(wsuf) - 1 ||
+        base.compare(base.size() - (sizeof(wsuf) - 1), sizeof(wsuf) - 1, wsuf) != 0) {
+        return nullptr;
+    }
+    if (ml.get_weight((base + ".idxlo0").c_str()) == nullptr) {
+        return nullptr;
+    }
+
+    const int64_t K = ne0, M = ne1;
+    const int64_t idx_len = M * K / g_orka_group;
+    const int64_t sc_len  = M * K / g_orka_block;
+    // Side tensors recurse through model.create_tensor (1D, so no re-entry into this
+    // resolver) and inherit the same layer/backend placement as the weight itself.
+    const std::string wpref = tn.suffix ? std::string(tn.suffix) : std::string("weight");
+    auto side = [&](const std::string & suf, std::initializer_list<int64_t> ne_) {
+        const std::string s = wpref + suf;
+        return model.create_tensor(ml, LLM_TN_IMPL(tn.arch, tn.tensor, s.c_str(), tn.bid, tn.xid), ne_, 0);
+    };
+
+    llama_orka_weight w{};
+    w.M = (int) M; w.K = (int) K;
+    w.group_size = (int) g_orka_group; w.block_size = (int) g_orka_block;
+    w.group_major = (int) g_orka_gmaj;
+    int n_stages = 0;
+    for (int s = 0; s < 3; s++) {
+        const std::string ss = std::to_string(s);
+        if (ml.get_weight((base + ".idxlo" + ss).c_str()) == nullptr) {
+            break;
+        }
+        ggml_tensor * cbm = ml.get_tensor_meta((base + ".cb" + ss).c_str());
+        GGML_ASSERT(cbm != nullptr && "orka: idxlo present without matching cb");
+        const int64_t cbsz = ggml_nelements(cbm) / g_orka_group;
+        int bits = 0;
+        while ((1ll << bits) < cbsz) bits++;
+        const int64_t hi_bytes = bits > 8 ? (idx_len * (bits - 8) + 7) / 8 : 1;
+        w.lo[s] = side(".idxlo" + ss, { idx_len });
+        w.hi[s] = side(".idxhi" + ss, { hi_bytes });
+        w.cb[s] = side(".cb" + ss,    { cbsz * g_orka_group });
+        w.idx_bits[s] = bits;
+        n_stages++;
+    }
+    GGML_ASSERT(n_stages > 0);
+    w.n_stages = n_stages;
+    w.scales = side(".scales", { sc_len });
+    if (ml.get_weight((base + ".corr_ptr").c_str()) != nullptr) {
+        ggml_tensor * colm = ml.get_tensor_meta((base + ".corr_col").c_str());
+        GGML_ASSERT(colm != nullptr && "orka: corr_ptr present without corr_col");
+        const int64_t nnz = ggml_nelements(colm);
+        w.corr_ptr = side(".corr_ptr", { M + 1 });
+        w.corr_col = side(".corr_col", { nnz });
+        w.corr_val = side(".corr_val", { nnz });
+    }
+    llama_orka_register(w.lo[0], w);
+    return (ggml_tensor *) w.lo[0];
+}
+
 // Unpack bit-plane indices (lo uint8 + hi packed) into resident I32 idx tensors. MSB-first
 // bitstream per the python _pack_indices: idx = lo | (hi_val << 8), hi_val read from `hi`.
 void llama_orka_finalize() {
@@ -36,41 +125,59 @@ void llama_orka_finalize() {
     if (g_orka_idx_ctx) { ggml_free(g_orka_idx_ctx); g_orka_idx_ctx = nullptr; }
     // skip the -fit dry-run load where tensors exist but have no backend buffer yet
     if (!g_orka.empty() && g_orka.begin()->second.lo[0] && g_orka.begin()->second.lo[0]->buffer) {
-        size_t n_idx = 0;
-        for (auto & kv : g_orka) n_idx += kv.second.n_stages;
-        ggml_init_params ip = { ggml_tensor_overhead() * (n_idx + 8), nullptr, true };
-        g_orka_idx_ctx = ggml_init(ip);
-        for (auto & kv : g_orka) {
-            llama_orka_weight & w = kv.second;
-            for (int s = 0; s < w.n_stages; s++) {
-                int64_t count = ggml_nelements(w.lo[s]);
-                w.idx[s] = ggml_new_tensor_1d(g_orka_idx_ctx, GGML_TYPE_I32, count);
+        // The CUDA warp GEMV reads the lo/hi bit-planes DIRECTLY on device (see
+        // orka_gemv_planes) and never touches the unpacked I32 idx tensors. Those
+        // idx tensors cost 4 bytes/index (vs 1-byte lo planes) - ~4x the whole index
+        // footprint, several GB on a 9B model - AND unpacking them is a scalar per-bit
+        // CPU loop over ~1B indices (minutes). So on the CUDA path with corrections
+        // handled in-kernel, skip the unpack entirely: fill warp args and return.
+        // Only the CPU get_rows fallback and ORKA_DECOMPRESS need the I32 idx.
+        const char * bn0 = ggml_backend_buft_name(ggml_backend_buffer_get_type(
+            g_orka.begin()->second.lo[0]->buffer));
+        const bool cuda = bn0 && strstr(bn0, "CUDA");
+        const bool need_idx = getenv("ORKA_DECOMPRESS") || !cuda;
+
+        if (need_idx) {
+            size_t n_idx = 0;
+            for (auto & kv : g_orka) n_idx += kv.second.n_stages;
+            ggml_init_params ip = { ggml_tensor_overhead() * (n_idx + 8), nullptr, true };
+            g_orka_idx_ctx = ggml_init(ip);
+            for (auto & kv : g_orka) {
+                llama_orka_weight & w = kv.second;
+                for (int s = 0; s < w.n_stages; s++) {
+                    int64_t count = ggml_nelements(w.lo[s]);
+                    w.idx[s] = ggml_new_tensor_1d(g_orka_idx_ctx, GGML_TYPE_I32, count);
+                }
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_orka.begin()->second.lo[0]->buffer);
+            g_orka_idx_buf = ggml_backend_alloc_ctx_tensors_from_buft(g_orka_idx_ctx, buft);
+
+            std::vector<uint8_t> lo, hi; std::vector<int32_t> idx;
+            for (auto & kv : g_orka) {
+                llama_orka_weight & w = kv.second;
+                for (int s = 0; s < w.n_stages; s++) {
+                    int64_t count = ggml_nelements(w.lo[s]);
+                    int hb = w.idx_bits[s] - 8;            // hi bits per index (0 if <=8)
+                    lo.resize(count); ggml_backend_tensor_get(w.lo[s], lo.data(), 0, count);
+                    hi.resize(ggml_nbytes(w.hi[s])); ggml_backend_tensor_get(w.hi[s], hi.data(), 0, hi.size());
+                    idx.resize(count);
+                    for (int64_t j = 0; j < count; j++) {
+                        uint32_t hival = 0;
+                        for (int b = 0; b < hb; b++) {
+                            size_t pos = (size_t) j * hb + b;
+                            int bit = (hi[pos >> 3] >> (7 - (pos & 7))) & 1;
+                            hival = (hival << 1) | (uint32_t) bit;   // MSB first
+                        }
+                        idx[j] = (int32_t) (lo[j] | (hival << 8));
+                    }
+                    ggml_backend_tensor_set(w.idx[s], idx.data(), 0, count * sizeof(int32_t));
+                }
             }
         }
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(g_orka.begin()->second.lo[0]->buffer);
-        g_orka_idx_buf = ggml_backend_alloc_ctx_tensors_from_buft(g_orka_idx_ctx, buft);
 
-        std::vector<uint8_t> lo, hi; std::vector<int32_t> idx;
         for (auto & kv : g_orka) {
             llama_orka_weight & w = kv.second;
-            for (int s = 0; s < w.n_stages; s++) {
-                int64_t count = ggml_nelements(w.lo[s]);
-                int hb = w.idx_bits[s] - 8;            // hi bits per index (0 if <=8)
-                lo.resize(count); ggml_backend_tensor_get(w.lo[s], lo.data(), 0, count);
-                hi.resize(ggml_nbytes(w.hi[s])); ggml_backend_tensor_get(w.hi[s], hi.data(), 0, hi.size());
-                idx.resize(count);
-                for (int64_t j = 0; j < count; j++) {
-                    uint32_t hival = 0;
-                    for (int b = 0; b < hb; b++) {
-                        size_t pos = (size_t) j * hb + b;
-                        int bit = (hi[pos >> 3] >> (7 - (pos & 7))) & 1;
-                        hival = (hival << 1) | (uint32_t) bit;   // MSB first
-                    }
-                    idx[j] = (int32_t) (lo[j] | (hival << 8));
-                }
-                ggml_backend_tensor_set(w.idx[s], idx.data(), 0, count * sizeof(int32_t));
-            }
-            // warp GEMV args (N=1 decode): device pointers straight to the bit-planes.
+            // warp GEMV args: device pointers straight to the bit-planes.
             const char * bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(w.lo[0]->buffer));
             if (bn && strstr(bn, "CUDA")) {
                 for (int s = 0; s < 3; s++) {
@@ -78,13 +185,20 @@ void llama_orka_finalize() {
                     w.warp.lo[s] = w.lo[s0]->data;
                     w.warp.hi[s] = w.hi[s0]->data;
                     w.warp.cb[s] = w.cb[s0]->data;
+                    w.warp.HI_BITS[s] = w.idx_bits[s0] > 8 ? w.idx_bits[s0] - 8 : 0;
                 }
                 w.warp.scale = w.scales->data;
+                w.warp.corr_ptr = w.corr_ptr ? w.corr_ptr->data : nullptr;
+                w.warp.corr_col = w.corr_col ? w.corr_col->data : nullptr;
+                w.warp.corr_val = w.corr_val ? w.corr_val->data : nullptr;
                 w.warp.M = w.M; w.warp.G = w.group_size; w.warp.GPR = w.K / w.group_size;
                 w.warp.BPR = w.K / w.block_size; w.warp.GPB = w.block_size / w.group_size;
-                w.warp.HI_BITS = w.idx_bits[0] > 8 ? w.idx_bits[0] - 8 : 0;
                 w.warp.N_STAGES = w.n_stages;
                 w.warp_ready = true;
+            } else if (w.corr_ptr && !getenv("ORKA_DECOMPRESS")) {
+                fprintf(stderr, "%s: WARNING: orka weight has corrections but no CUDA backend "
+                        "and ORKA_DECOMPRESS is off - the get_rows fallback DROPS corrections "
+                        "(degraded quality). Set ORKA_DECOMPRESS=1 or run on CUDA.\n", __func__);
             }
         }
     }
@@ -142,6 +256,19 @@ void llama_orka_materialize() {
                 Wf[(size_t) m * K + k] = acc * ggml_fp16_to_fp32(sch[(size_t) m * BPR + blk]); // W^T[k,m]
             }
         }
+        if (w.corr_ptr) {
+            // CSR delta (salient/outlier exact-value corrections) baked into the dense W.
+            std::vector<int32_t> cp(ggml_nelements(w.corr_ptr)), cc(ggml_nelements(w.corr_col));
+            std::vector<ggml_fp16_t> cv(ggml_nelements(w.corr_val));
+            ggml_backend_tensor_get(w.corr_ptr, cp.data(), 0, ggml_nbytes(w.corr_ptr));
+            ggml_backend_tensor_get(w.corr_col, cc.data(), 0, ggml_nbytes(w.corr_col));
+            ggml_backend_tensor_get(w.corr_val, cv.data(), 0, ggml_nbytes(w.corr_val));
+            for (int m = 0; m < M; m++) {
+                for (int32_t i = cp[m]; i < cp[m + 1]; i++) {
+                    Wf[(size_t) m * K + cc[i]] += ggml_fp16_to_fp32(cv[i]);
+                }
+            }
+        }
         Wq.resize(ggml_nbytes(w.Wmat));
         ggml_quantize_chunk(GGML_TYPE_Q8_0, Wf.data(), Wq.data(), 0, M, K, nullptr); // M rows of K
         ggml_backend_tensor_set(w.Wmat, Wq.data(), 0, Wq.size());
@@ -152,8 +279,16 @@ ggml_tensor * llama_orka_build_mm(ggml_context * ctx, const llama_orka_weight & 
 #ifdef GGML_USE_CUDA
     // hybrid: N=1 decode -> warp GEMV off the bit-planes (396 t/s, no W); this beats both the
     // materialized mul_mat (110) and the get_rows path, so it takes priority for decode even
-    // when Wmat exists. N>1 prefill falls through to Wmat (fast GEMM) or get_rows below.
-    if (cur->ne[1] == 1 && w.warp_ready) {
+    // when Wmat exists. N>1 prefill prefers Wmat (one GEMM); without Wmat the warp kernel
+    // handles N>1 as one GEMV per column (re-reads the planes per column - slower prefill,
+    // but compressed-resident AND correction-exact, unlike the get_rows fallback).
+    //
+    // Deliberately NOT gated on warp_ready: graph RESERVE runs before finalize fills the
+    // args, and reserving the get_rows fallback instead sizes the compute buffer for full
+    // dense-W transients (measured 6.5GB on a 9B pack - an instant OOM on 12GB cards).
+    // The node stores a POINTER to w.warp; finalize fills it in place before the first
+    // real execution. A CPU-placed execution hits the sentinel abort with a clear message.
+    if (cur->ne[1] == 1 || !w.Wmat) {
         ggml_tensor * xf = ggml_cast(ctx, cur, GGML_TYPE_F16);
         return ggml_orka_warp(ctx, xf, &w.warp);
     }
